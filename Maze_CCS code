@@ -1,0 +1,436 @@
+#include <msp430.h>
+#include <msp430f1491.h>            // MCU = MSP430F1491 Family Series
+#include <math.h>                   // ESD CCS Code
+
+#define TA_DUTY 4600                // T = 1ms //4.6MHz
+#define TB_DUTY 46000               // T = 10ms //4.6MHz
+#define SERVO_MID TB_DUTY*3/20      // 1.5ms
+#define regXL 0x28                  // X low bit address    (Accelerometer, Gyroscope)
+#define regXH 0x29                  // X high bit address
+#define regYL 0x2A                  // Y
+#define regYH 0x2B
+#define regZL 0x2C                  // Z
+#define regZH 0x2D
+#define ACCEL_CS 0x01               // Accel Chip Select Pin
+#define GYRO_CS 0x80                // Gyro Chip Select Pin
+
+// Initialization and PWM
+void initPorts();
+void readyLED();
+void configTA_PWM();
+void configTB_PWM();
+// SPI function
+void initSPI();
+void chkConfigSPI();
+unsigned char Transfer(unsigned char addr);
+void sendDataSPI(unsigned char regAddr, unsigned char data, char mode);
+unsigned char recvDataSPI(unsigned char regAddr, char mode);
+// Get and calculator Accel, Gyro data
+void accelWhoAmI();
+void gyroWhoAmI();
+void getAccel();
+void getGyro();
+void calFilter();
+void caldt();
+
+// Global variable
+unsigned long long milsec = 0;      // count millisecond
+char who = 0x00;                    // Who am i (Accel, Gyro)
+short mergeAccelX = 0;              // 12bit data of Accelerometer
+short mergeAccelY = 0;
+short mergeAccelZ = 0;
+//double gravityX = 0.0f;
+//double gravityY = 0.0f;
+//double gravityZ = 0.0f;
+short mergeGyroX = 0;               // 16bit data of Gyroscope
+short mergeGyroY = 0;
+short mergeGyroZ = 0;
+//double gyroX = 0.0f;
+//double gyroY = 0.0f;
+//double gyroZ = 0.0f;
+double angleX = 0.0f;
+double angleY = 0.0f;
+//double angleZ = 0.0f;
+unsigned int prevmilsec = 0;        // use for calculate dt
+unsigned int nowmilsec = 0;
+double dt = 0.01f;
+int resX = 0;                       // result of Servo PWM
+int resY = 0;
+double degX;
+double degY;
+double gyrX;
+double gyrY;
+
+int main(void)
+{
+    WDTCTL = WDTPW + WDTHOLD;                          // Stop Watchdog Timer
+    DCOCTL = DCO0+DCO1+DCO2;                    // Max DCO
+    BCSCTL1 = RSEL0+RSEL1+RSEL2+XT2OFF;         // Max RSEL, XT2 OFF
+
+    initPorts();        // Pin initialize
+
+    P1DIR |= 0x01;      // LED pin
+    P1OUT &= ~0x01;
+    P5DIR |= 0x70;      // MCLK, ACLK, SMCLK pin
+    P5SEL |= 0x70;
+
+    P1IE &=0x00;        // Interrupt pin init
+    P1IES &=0x00;
+    P1IFG &=0x00;
+
+    P2IE &=0x00;
+    P2IES &=0x00;
+    P2IFG &=0x00;
+
+    __bis_SR_register(GIE); // General Interrupt Enable
+    configTA_PWM();     // TimerA PWM configuration
+    configTB_PWM();     // TimerB PWM configuration
+    initSPI();          // SPI (Accelerometer, Gyroscope)
+    readyLED();         // blink LED 3times
+    P1OUT |= 0x01;      // LED ON = Configuration and Initailization Success
+    prevmilsec = milsec;
+
+    float maxcal = TB_DUTY*(0.9)/10;  // Servo max degree = 900us
+    while(1)
+    {
+        // Calculate Filtered data
+        //caldt();
+        if (P3IN & 0x20 == 0x20) getGyro();
+        getAccel();
+        calFilter();
+
+        // Calculate Servo PWM
+        if(angleX <= 45 && angleX >= -45) resX = (angleX / 90) * maxcal;    //max 45 degree
+        else {
+            if(angleX >= 0) resX = (angleX/angleX)*(maxcal/2);
+            else resX = -(angleX/angleX)*(maxcal/2);
+        }
+        if(angleY <= 45 && angleY >= -45) resY = (angleY / 90) * maxcal;    //max 45 degree
+        else {
+            if(angleY >= 0) resY = (angleY/angleY)*(maxcal/2);
+            else resY = -(angleY/angleY)*(maxcal/2);
+        }
+        
+        // Change duty of PWM
+        TBCCR3 = SERVO_MID + resX;
+        TBCCR2 = SERVO_MID - resY;
+    }
+}
+void configTA_PWM(){                            // TimerA = count millisecond
+    TACTL = TASSEL_2 + TACLR;
+    CCTL0 = OUTMOD_7+CCIE;                      // CCR0 reset/set
+    CCR0 = TA_DUTY;                             // PWM Period
+    TACTL = TASSEL_2 + MC_1+ TAIE;              // TASSEL_2 = SMCLK, MC_1 = up mode, TAIE = TimerA Interrupt Enable
+}
+void configTB_PWM()                             // TimerB = Servo Motor PWM
+{
+    P4DIR |= 0x7E;
+    P4SEL |= 0x7E;
+
+    TBCCR0 = TB_DUTY;
+    TBCCTL2 = OUTMOD_7;
+    TBCCR2 = SERVO_MID;                         // Y axis 
+    TBCCTL3 = OUTMOD_7;
+    TBCCR3 = SERVO_MID;                         // X axis
+    TBCTL = TBSSEL_2 + MC_1 + TBIE;            // SMCLK, up mode, TimerB Interrupt Enable
+}
+void initSPI()
+{
+    P3SEL |= 0x0E;                           // UCLK, SIMO, SOMI, CS(Accel), CS(Gyro) pin
+    P3DIR |= 0x0B;                           
+    P3OUT |= 0x01;
+
+    P2DIR |= 0x80;
+    P2OUT |= 0x80;
+    P3DIR &= ~0x20;
+
+    U0CTL |= CHAR + SYNC + MM + SWRST;       // 8bit, SPI mode, Master mode
+    U0TCTL = SSEL1 + CKPL + STC;             // SMCLK, 3-pin mode, falling edge
+
+    U0BR0 = 0x02;                   //Baudrate
+    U0BR1 = 0x00;
+    U0MCTL = 0x00;
+
+    ME1 = USPIE0;
+    U0CTL &= ~SWRST;
+    //IE1 |= URXIE0;            // not used for TimerA0 Interrupt
+
+    U0TXBUF &= 0x00;
+    U0RXBUF &= 0x00;
+
+    //Configuration to Accelerometer
+    //PM : NormalMode(001) / Data rate(11) = 1000Hz / X,Y,Z enable
+    sendDataSPI(0x20, 0b00111111, 'A');      //CTRL_REG1
+    //Full Scale : 11 -> +-8g, BDU = 0
+    sendDataSPI(0x23, 0b00110000, 'A');      //CTRL_REG4
+
+    //Configuration to Gyroscope
+    //PowerDown : NormalMode / X,Y,Z enable
+    sendDataSPI(0x20, 0b00001111, 'G');
+    //DRDY : Data Ready
+    sendDataSPI(0x22, 0b00001000, 'G');
+    //Full Scale : 10 -> 2000dps
+    sendDataSPI(0x23, 0b00100000, 'G');
+
+    while (who != 0xd3) // Gyro who am i = 0xd3
+    {
+        if (P3IN & 0x20 == 0x20) gyroWhoAmI();
+    }
+    who = 0x00;
+    while (who != 0x32) // Accel who am i = 0x32
+    {
+        accelWhoAmI();
+    }
+    P1OUT |= 0x01;
+}
+unsigned char Transfer(unsigned char addr)      // SPI Transfer
+{
+    unsigned char data;
+    while(U0IFG & UTXIFG0 != UTXIFG0){}
+    U0TXBUF = addr;
+    while(U0IFG & URXIFG0 != URXIFG0){}
+    data = U0RXBUF;
+    while(U0IFG & UTXIFG0 != UTXIFG0){}
+    U0TXBUF = addr;
+    while(U0IFG & URXIFG0 != URXIFG0){}
+    data = U0RXBUF;
+    return data;
+}
+void sendDataSPI(unsigned char regAddr, unsigned char data, char mode)
+{
+    if(mode == 'A') P3OUT &= ~ACCEL_CS;
+    else if(mode == 'G') P2OUT &= ~GYRO_CS;
+    Transfer(regAddr);
+    Transfer(data);
+    if(mode == 'A') P3OUT |= ACCEL_CS;
+    else if(mode == 'G') P2OUT |= GYRO_CS;
+    __delay_cycles(10);
+}
+unsigned char recvDataSPI(unsigned char regAddr, char mode)
+{
+    unsigned char rbyte;
+    if(mode == 'A') P3OUT &= ~ACCEL_CS;
+    else if(mode == 'G') P2OUT &= ~GYRO_CS;
+    regAddr |= 0x80;                        // send MSB = 1 : read data
+    Transfer(regAddr);
+    rbyte = Transfer(0x00);
+    if(mode == 'A') P3OUT |= ACCEL_CS;
+    else if(mode == 'G') P2OUT |= GYRO_CS;
+    __delay_cycles(10);
+    return rbyte;
+}
+void accelWhoAmI(){                 // WHO AM I
+    P3OUT &= ~ACCEL_CS;
+    who = Transfer(0x8f);           // who am i address = 0x0f | 0x80 : I want to read Who am i data
+    who = Transfer(0x00);
+    P3OUT |= ACCEL_CS;
+}
+void gyroWhoAmI(){
+    P2OUT &= ~GYRO_CS;
+    who = Transfer(0x8f);
+    who = Transfer(0x00);
+    P2OUT |= GYRO_CS;
+}
+void chkConfigSPI(){
+    accelWhoAmI();
+    gyroWhoAmI();
+
+    // Accel
+    who = recvDataSPI(0x20, 'A');    //CTRL_REG1
+    who = recvDataSPI(0x21, 'A');    //CTRL_REG2
+    who = recvDataSPI(0x22, 'A');    //CTRL_REG3
+    who = recvDataSPI(0x23, 'A');    //CTRL_REG4
+    who = recvDataSPI(0x24, 'A');    //CTRL_REG5
+
+    // Gyro
+    who = recvDataSPI(0x20, 'G');    //CTRL_REG1
+    who = recvDataSPI(0x21, 'G');    //CTRL_REG2
+    who = recvDataSPI(0x22, 'G');    //CTRL_REG3
+    who = recvDataSPI(0x23, 'G');    //CTRL_REG4
+    who = recvDataSPI(0x24, 'G');    //CTRL_REG5
+}
+
+void getAccel(){        // get 12bit data of accel
+
+    // Get data X
+    char accelXL = recvDataSPI(regXL, 'A');
+    char accelXH = recvDataSPI(regXH, 'A');
+    // Check MSB complement
+    accelXL = accelXH << 4 | accelXL >> 4;
+    if((accelXH & 0x80) == 0x80) accelXH = 0xF0 | accelXH >> 4;
+    else accelXH = accelXH >> 4;
+    __delay_cycles(10);
+
+    // Y
+    char accelYL = recvDataSPI(regYL, 'A');
+    char accelYH = recvDataSPI(regYH, 'A');
+    accelYL = accelYH << 4 | accelYL >> 4;
+    if((accelYH & 0x80) == 0x80) accelYH = 0xF0 | accelYH >> 4;
+    else accelYH = accelYH >> 4;
+    __delay_cycles(10);
+
+    // Z
+    char accelZL = recvDataSPI(regZL, 'A');
+    char accelZH = recvDataSPI(regZH, 'A');
+    accelZL = accelZH << 4 | accelZL >> 4;
+    if((accelZH & 0x80) == 0x80) accelZH = 0xF0 | accelZH >> 4;
+    else accelZH = accelZH >> 4;
+    __delay_cycles(10);
+
+    // Merge bits
+    mergeAccelX = accelXH << 8 | accelXL;
+    mergeAccelY = accelYH << 8 | accelYL;
+    mergeAccelZ = accelZH << 8 | accelZL;
+
+    // Calculate
+    //gravityX = mergeAccelX*0.0039;
+    //gravityY = mergeAccelY*0.0039;
+    //gravityZ = mergeAccelZ*0.0039;
+
+    __delay_cycles(10);
+}
+void getGyro(){         // get 16bit data of gyro
+
+    // Get data X
+    char gyroXL = recvDataSPI(regXL, 'G');
+    char gyroXH = recvDataSPI(regXH, 'G');
+    __delay_cycles(10);
+
+    // Y
+    char gyroYL = recvDataSPI(regYL, 'G');
+    char gyroYH = recvDataSPI(regYH, 'G');
+    __delay_cycles(10);
+
+    // Z
+    char gyroZL = recvDataSPI(regZL, 'G');
+    char gyroZH = recvDataSPI(regZH, 'G');
+    __delay_cycles(10);
+
+    // Merge
+    mergeGyroX = gyroXH << 8 | gyroXL;
+    mergeGyroY = gyroYH << 8 | gyroYL;
+    mergeGyroZ = gyroZH << 8 | gyroZL;
+
+    //gyroX = mergeGyroX*0.07;
+    //gyroY = mergeGyroY*0.07;
+    //gyroZ = mergeGyroZ*0.07;
+    __delay_cycles(10);
+}
+void caldt(){
+    nowmilsec = milsec;
+    if(nowmilsec < prevmilsec) dt = (100000 - prevmilsec + nowmilsec) / 1000;
+    else dt = (nowmilsec - prevmilsec) / 1000;
+    prevmilsec = nowmilsec;
+}
+void calFilter(){
+    // Complementary Filter
+    double sqrtAccelYZ = sqrt(pow(mergeAccelY, 2) + pow(mergeAccelZ, 2));
+    degX = atan(-mergeAccelX / sqrtAccelYZ)*180/3.14159;
+    double sqrtAccelXZ = sqrt(pow(mergeAccelX, 2) + pow(mergeAccelZ, 2));
+    degY = atan(-mergeAccelY / sqrtAccelXZ)*180/3.14159;
+    gyrX = (double)mergeGyroX/131;
+    gyrY = (double)mergeGyroY/131;
+    angleX = (0.96*(angleX+(gyrX*dt))) + (0.04*degX);
+    angleY = (0.96*(angleY+(gyrY*dt))) + (0.04*degY);
+    __delay_cycles(10);
+}
+void readyLED(void) {
+    volatile int i=0;
+    volatile int j=0;
+    P1OUT &= ~0x01;
+    for (i=0; i < 6; i++) {
+        P1OUT ^= 0x01;
+        for(j=0;j<10000;j++);
+    }
+}
+void initPorts(){
+    P1DIR &= 0x00;
+    P1OUT &= 0x00;
+    P1SEL &= 0x00;
+
+    P2DIR &= 0x00;
+    P2OUT &= 0x00;
+    P2SEL &= 0x00;
+
+    P3DIR &= 0x00;
+    P3OUT &= 0x00;
+    P3SEL &= 0x00;
+
+    P4DIR &= 0x00;
+    P4OUT &= 0x00;
+    P4SEL &= 0x00;
+
+    P5DIR &= 0x00;
+    P5OUT &= 0x00;
+    P5SEL &= 0x00;
+
+    P6DIR &= 0x00;
+    P6OUT &= 0x00;
+    P6SEL &= 0x00;
+}
+
+// Timer A0 interrupt service routine
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=TIMERA0_VECTOR
+__interrupt void Timer_A0(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(TIMERA0_VECTOR))) Timer_A0(void)         // count millisecond
+#else
+#error Compiler not supported!
+#endif
+{
+    milsec++;
+    if(milsec>1000000) milsec = 0;
+}
+// Timer_A Interrupt Vector (TAIV) handler
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=TIMERA1_VECTOR
+__interrupt void Timer_A3(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(TIMERA1_VECTOR))) Timer_A3(void)
+#else
+#error Compiler not supported!
+#endif
+{
+  switch( TAIV )
+  {
+    case  2:  break;                        // CCR1 not used
+    case  4:  break;                        // CCR2 not used
+    case 10:  break;                        // overflow
+
+  }
+}
+
+// Timer B0 interrupt service routine
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=TIMERB0_VECTOR
+__interrupt void Timer_B0 (void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(TIMERB0_VECTOR))) Timer_B0 (void)
+#else
+#error Compiler not supported!
+#endif
+{
+}
+// Timer_B7 Interrupt Vector (TBIV) handler
+#if defined(__TI_COMPILER_VERSION__) || defined(__IAR_SYSTEMS_ICC__)
+#pragma vector=TIMERB1_VECTOR
+__interrupt void Timer_B7(void)
+#elif defined(__GNUC__)
+void __attribute__ ((interrupt(TIMERB1_VECTOR))) Timer_B7 (void)
+#else
+#error Compiler not supported!
+#endif
+{
+ switch( TBIV )
+ {
+   case  2: break;                          // CCR1 not used
+   case  4: break;                          // CCR2 not used
+   case  6: break;                          // CCR3 not used
+   case  8: break;                          // CCR4 not used
+   case 10: break;                          // CCR5 not used
+   case 12: break;                          // CCR6 not used
+   case 14: break;                          // overflow
+  }
+}
+
